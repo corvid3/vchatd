@@ -1,0 +1,7 @@
+CFLAGS += -Wall -Wextra -Werror -pedantic 
+CFLAGS += --std=c11
+CFLAGS += -fstack-protector-all 
+CFLAGS += -g
+
+: foreach *.c |> clang $(CFLAGS) -c %f -o %o |> %B.o
+: *.o tomlc99/libtoml.a |> clang %f -o %o -g |> vchatd.out
