@@ -9,15 +9,9 @@
 
 struct vcd_worker_handle {
 	pthread_mutex_t* num_cons_mutex;
-	// is accepting new connections
-	// TODO: implement this, i'm going to sleep
-	bool* accepting;
-	int *num_cons;
-
-  // pipe<struct vcd_message*>
+	const int* num_cons;
+	int* num_incoming_cons;
 	int con_msg_rx;
-
-	// pipe<struct vcd_connection*>
 	int new_con_tx;
 
 	pthread_t thread;

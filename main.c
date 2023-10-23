@@ -31,6 +31,8 @@ main(int argc, const char** argv)
   // shut down the acceptor
   pthread_cancel(accept.thread);
 
+  close(accept.acceptor_fd_copy);
+
   // destroy the config
   config_destroy(&conf);
 }

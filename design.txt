@@ -1,0 +1,58 @@
+# vchatd chat server | internal design
+
+vchatd is internally split up into multiple components,
+	each performing a different duty
+
+a list of the components are listed below, alongside their related files
+	- initializer 
+		main.c
+	- argument parser
+		args.c
+		args.h
+	- config handler
+		config.c
+		config.h
+	- acceptor
+		acceptor.c
+		acceptor.h
+	- boss
+		boss.c
+		boss.h
+	- connection workers
+		worker.c
+		worker.h
+	- logic workers
+		wlogic.c
+		wlogic.h
+
+descriptions of each components are to be found below
+
+# the initializer
+the initializer handles the starting and termination
+	of the vchatd daemon
+most of the init/term logic are found in the minimal main.c file
+
+# argument parser
+the argument parser is a simple argc/argv parser using basic POSIX functions
+the initializer calls the argument parser, gets the results, and forwards
+	any information to the config handler
+
+# config handler
+the config handler takes in information from the system or any arguments
+	given to the daemon, and parses a .toml config file
+the resulting parsed config file is translated into a struct and
+	passed around the program as a const* global
+
+# acceptor
+running in it's own thread, the acceptor sets up a listened TCP port
+	on a certain address and port (as described in the global config struct)
+	and takes in any incoming connections
+incoming connections are forwarded to the boss/message manager.
+
+# boss / message manager
+the boss is the heart of the vchatd implementation, working as the
+	message coordinator, making sure the right questions between workers
+	get to eachother.
+the boss also makes a few decisions, such as which worker to send
+	new connections to, which logic handler to send a question to,
+	etcetera

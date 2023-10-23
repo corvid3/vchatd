@@ -1,14 +1,18 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "acceptor.h"
 #include "connection.h"
+#include "log.h"
 
 struct acceptor_logic_args
 {
@@ -36,27 +40,32 @@ acceptor_logic(void* vp_args)
 
     int newfd;
     struct sockaddr addr;
-    socklen_t addrlen;
+    socklen_t addrlen = sizeof(addr);
 
     if ((newfd = accept(fd.fd, &addr, &addrlen)) < 0) {
-      printf("some error occured while accepting, continuing\n");
+      VC_LOG_ERR("acceptor accept error");
+      VC_LOG_ERR_CONT("ERR %i: %s", errno, strerror(errno));
       continue;
     }
 
     if (addr.sa_family != AF_INET) {
+      printf("incoming connection is not ipv4, closing\n");
       close(newfd);
     }
 
     struct sockaddr_in* inaddr = (struct sockaddr_in*)&addr;
-    printf("new incoming connection from %s\n", inet_ntoa(inaddr->sin_addr));
-    fflush(stdout);
+    // printf("new incoming connection from %s\n", inet_ntoa(inaddr->sin_addr));
+    // fflush(stdout);
 
     struct vcd_connection con = {
       .addr = inaddr->sin_addr.s_addr,
       .sockfd = newfd,
     };
 
-    vcd_connection_serialize(args.incoming_pipe_tx, con);
+    if (!vcd_connection_serialize(args.incoming_pipe_tx, con)) {
+      VC_LOG_ERR("failed to send incoming connection to boss as acceptor");
+      raise(SIGTERM);
+    }
   }
 }
 
@@ -79,6 +88,9 @@ start_acceptor(struct vcd_config* config)
 
   sockaddr.sin_port = config->server.port;
   sockaddr.sin_family = AF_INET;
+
+  int t = 1;
+  setsockopt(infd, SOL_SOCKET, SO_REUSEADDR, &t, sizeof t);
 
   if (bind(infd, (struct sockaddr*)&sockaddr, sizeof sockaddr) < 0) {
     fprintf(stderr, "failed to bind acceptor socket to ip & port\n");
@@ -103,6 +115,7 @@ start_acceptor(struct vcd_config* config)
   struct vcd_acceptor_return ret = {
     .incoming_pipe_rx = inpipe[0],
     .thread = thread,
+    .acceptor_fd_copy = infd,
   };
 
   return ret;

@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <pthread.h>
 
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,23 +14,6 @@
 #include "connection.h"
 #include "log.h"
 #include "worker.h"
-
-struct worker_args
-{
-  const struct vcd_config* config;
-
-  pthread_mutex_t* num_cons_mutex;
-  int* num_cons;
-  bool* accepting_cons;
-
-  // pipe<struct vcd_message*>
-  int con_msg_tx;
-
-  // pipe<struct vcd_connection*>
-  int new_con_rx;
-
-  int id;
-};
 
 // stores state alongside a vcd_connection
 struct worker_connection
@@ -59,7 +43,7 @@ struct worker
 
   pthread_mutex_t* num_cons_mutex;
   int* num_cons;
-  bool* accepting_cons;
+  int* num_incoming_cons;
 
   int con_msg_tx;
   int new_con_rx;
@@ -67,52 +51,14 @@ struct worker
   int id;
 };
 
-static struct worker
-worker_init(void* vp_args)
-{
-  struct worker_args* args = (struct worker_args*)vp_args;
-  printf("OUTER %i %i\n", args->id, *args->num_cons);
-
-  const int max_cons = args->config->connections.max_connections;
-
-  const int* num_cons = args->num_cons;
-  printf("ASDF: ID: %i | %i\n", args->id, *num_cons);
-
-  struct worker worker = {
-    .config = args->config,
-
-    .connections = malloc(sizeof(struct worker_connection) * max_cons),
-    .pollfds = malloc(sizeof(struct pollfd) * (max_cons + 1)),
-
-    .num_cons = args->num_cons,
-    .accepting_cons = args->accepting_cons,
-    .num_cons_mutex = args->num_cons_mutex,
-
-    .con_msg_tx = args->con_msg_tx,
-    .new_con_rx = args->new_con_rx,
-
-    .id = args->id,
-  };
-
-  // alongside listening to socket FD's,
-  // we need to also listen to the new_con_rx pipe
-  // so we also add 1 to the poll(...) call (see below)
-  worker.pollfds[0].events = POLLIN;
-  worker.pollfds[0].fd = worker.new_con_rx;
-
-  printf("ASDF: ID: %i | %i\n", worker.id, *num_cons);
-
-  return worker;
-}
-
 // returns the index into the pollfd array
 static inline int
 worker_get_pollfd_by_fd(struct worker* worker, int fd)
 {
   const int num_cons = *worker->num_cons;
   for (int i = 0; i < num_cons; i++)
-    if (worker->pollfds[i].fd == fd)
-      return i;
+    if (worker->pollfds[i + 1].fd == fd)
+      return i + 1;
 
   VC_LOG_ERR("fell out");
   exit(1);
@@ -127,6 +73,7 @@ worker_get_con_by_fd(struct worker* worker, int fd)
       return i;
 
   VC_LOG_ERR("fell out");
+  VC_LOG_ERR_CONT("worker id: %i, num_cons: %i", worker->id, *worker->num_cons);
   exit(1);
 }
 
@@ -135,13 +82,17 @@ worker_get_con_by_fd(struct worker* worker, int fd)
 static void
 worker_remove_sock(struct worker* worker, int fd)
 {
-  printf("removing socket\n");
+  // printf("removing socket\n");
   const int num_cons = *worker->num_cons;
 
   const int pidx = worker_get_pollfd_by_fd(worker, fd);
   const int cidx = worker_get_con_by_fd(worker, fd);
 
-  worker->pollfds[pidx] = worker->pollfds[num_cons - 1];
+  struct worker_connection* con = &worker->connections[cidx];
+  if (con->data_buf)
+    free(con->data_buf);
+
+  worker->pollfds[pidx] = worker->pollfds[num_cons];
   worker->connections[cidx] = worker->connections[num_cons - 1];
 
   *worker->num_cons -= 1;
@@ -150,9 +101,9 @@ worker_remove_sock(struct worker* worker, int fd)
 static void
 worker_disconnect(struct worker* worker, int fd)
 {
-  printf("disconnecting socket\n");
-  close(fd);
+  // printf("disconnecting socket\n");
   worker_remove_sock(worker, fd);
+  close(fd);
 }
 
 static void
@@ -161,7 +112,10 @@ worker_seek_logic(struct worker* worker, struct worker_connection* con)
   const int rb = read(con->connection.sockfd, con->len_buf, 2);
 
   if (rb <= 0) {
-    worker_remove_sock(worker, con->connection.sockfd);
+    VC_LOG_ERR("client disconnected while in seek stage");
+    if (rb < 0)
+      VC_LOG_ERR_CONT("ERRNO %i: %s", errno, strerror(errno));
+    worker_disconnect(worker, con->connection.sockfd);
     return;
   }
 
@@ -174,6 +128,10 @@ worker_seek_logic(struct worker* worker, struct worker_connection* con)
     con->len_buf_len = 0;
     con->mode = CON_READING;
 
+    printf("WORKER %i | %i BYTES OF DATA\n",
+           worker->id,
+           *(unsigned short*)con->len_buf);
+
     con->data_buf = malloc(*(unsigned short*)con->len_buf);
   }
 }
@@ -181,61 +139,73 @@ worker_seek_logic(struct worker* worker, struct worker_connection* con)
 static void
 worker_read_logic(struct worker* worker, struct worker_connection* con)
 {
-  const int req = con->data_buf_len - *(unsigned short*)con->len_buf;
+  const int req = *(unsigned short*)con->len_buf - con->data_buf_len;
   const int rb =
     read(con->connection.sockfd, con->data_buf + con->data_buf_len, req);
 
   if (rb <= 0) {
+    VC_LOG_ERR("client disconnected while in read stage");
     worker_remove_sock(worker, con->connection.sockfd);
     return;
   }
 
   con->data_buf_len += rb;
   if (con->data_buf_len == *(unsigned short*)con->len_buf) {
-    con->data_buf_len = 0;
-
-    printf("GOT MESSAGE: %s\n", con->data_buf);
-    write(
-      con->connection.sockfd, &con->data_buf_len, sizeof(con->data_buf_len));
+    //   // printf("GOT MESSAGE: %s\n", con->data_buf);
+    unsigned short reply_len = con->data_buf_len;
+    write(con->connection.sockfd, &reply_len, sizeof(unsigned short));
     write(con->connection.sockfd, con->data_buf, con->data_buf_len);
 
-    worker_disconnect(worker, con->connection.sockfd);
-
+    con->data_buf_len = 0;
     free(con->data_buf);
+    con->data_buf = NULL;
+
+    con->mode = CON_SEEKING;
+
+    worker_disconnect(worker, con->connection.sockfd);
   }
+}
+
+static struct worker_connection
+work_con_from_vcd_con(struct vcd_connection con)
+{
+  struct worker_connection wc = {
+    .connection = con,
+    .mode = CON_SEEKING,
+    .len_buf = { 0, 0 },
+    .len_buf_len = 0,
+    .data_buf = NULL,
+    .data_buf_len = 0,
+  };
+
+  return wc;
 }
 
 static void
 worker_add_new(struct worker* worker, struct vcd_connection con)
 {
-  printf("adding socket\n");
+  printf("ID: %i | new incoming connection\n", worker->id);
   pthread_mutex_lock(worker->num_cons_mutex);
-  worker->connections[*worker->num_cons].connection = con;
-  worker->pollfds[*worker->num_cons + 1].fd = con.sockfd;
-  worker->pollfds[*worker->num_cons + 1].events = POLLIN;
+  const int num_cons = *worker->num_cons;
+  worker->connections[num_cons] = work_con_from_vcd_con(con);
+  worker->pollfds[num_cons + 1].fd = con.sockfd;
+  worker->pollfds[num_cons + 1].events = POLLIN;
   *worker->num_cons += 1;
-  *worker->accepting_cons = true;
+  *worker->num_incoming_cons -= 1;
   pthread_mutex_unlock(worker->num_cons_mutex);
 }
 
 static void*
 worker_logic(void* vp_args)
 {
-  const struct worker_args* t = vp_args;
-  printf("id: %i NUM_CONS: %i \n",
-         ((struct worker_args*)vp_args)->id,
-         *((struct worker_args*)vp_args)->num_cons);
-  printf("OUTER %i %i\n", t->id, *t->num_cons);
-  struct worker worker = worker_init(vp_args);
+  struct worker worker = *(struct worker*)vp_args;
   free(vp_args);
+
+  printf("WORKER %i | spawned\n", worker.id);
 
   for (;;) {
     // guarantee that we are not dereferencing the atomic every time
     const int num_cons = *worker.num_cons;
-    printf("id: %i NUM_CONS: %i @ %p \n",
-           ((struct worker_args*)vp_args)->id,
-           num_cons,
-           (void*)worker.num_cons);
 
     if (poll(worker.pollfds, num_cons + 1, -1) < 0) {
       VC_LOG_ERR("poll err");
@@ -243,25 +213,17 @@ worker_logic(void* vp_args)
       exit(1);
     }
 
-    if (worker.pollfds[0].revents & POLLIN) {
-      struct vcd_connection new =
-        vcd_connection_deserialize(worker.pollfds[0].fd);
-      worker_add_new(&worker, new);
-    }
+    //   // printf("WORKER %i: num cons: %i\n", worker.id, *worker.num_cons);
 
     for (int i = 0; i < num_cons; i++) {
-      struct pollfd* pollfd = &worker.pollfds[i + i];
+      struct pollfd* pollfd = &worker.pollfds[i + 1];
 
       // if this socket doesn't have anything on it, continue
       if (!(pollfd->revents & POLLIN))
         continue;
 
-      struct worker_connection* con;
-
-      // search for the connection that is
-      for (int i = 0; i < num_cons; i++)
-        if (worker.connections[i].connection.sockfd == pollfd->fd)
-          con = &worker.connections[i];
+      const int con_index = worker_get_con_by_fd(&worker, pollfd->fd);
+      struct worker_connection* con = &worker.connections[con_index];
 
       switch (con->mode) {
         case CON_SEEKING:
@@ -271,7 +233,26 @@ worker_logic(void* vp_args)
         case CON_READING:
           worker_read_logic(&worker, con);
           break;
+
+        default:
+          VC_LOG_ERR("fell out of switch(con->mode)");
       }
+    }
+
+    if (worker.pollfds[0].revents & POLLERR) {
+      VC_LOG_ERR("newconfd pollerr'd");
+      raise(SIGTRAP);
+    }
+
+    if (worker.pollfds[0].revents & POLLIN) {
+      struct vcd_connection new;
+      if (!vcd_connection_deserialize(worker.pollfds[0].fd, &new)) {
+        VC_LOG_ERR("failed to get incoming connection from boss as worker");
+        VC_LOG_ERR_CONT("ERRNO %i: %s", errno, strerror(errno));
+        raise(SIGTRAP);
+      }
+
+      worker_add_new(&worker, new);
     }
   }
 
@@ -281,48 +262,53 @@ worker_logic(void* vp_args)
 extern struct vcd_worker_handle
 worker_spawn(const struct vcd_config* config, int id)
 {
-  int* num_cons = malloc(sizeof(int));
-  bool* accepting_cons = malloc(sizeof(bool));
+  const int max_cons =
+    config->connections.max_connections / config->server.num_workers;
 
-  if (!num_cons)
-    VC_LOG_ERR("num cons is null");
-  if (!accepting_cons)
-    VC_LOG_ERR("accepting cons is null");
+  int new_con[2], con_msg[2];
+  pipe(new_con);
+  pipe(con_msg);
 
-  *num_cons = 0;
-  *accepting_cons = true;
-
-  int msgpipe[2], newpipe[2];
-  pipe(msgpipe);
-  pipe(newpipe);
-
-  pthread_mutex_t* mutex = malloc(sizeof(pthread_mutex_t));
-  pthread_mutex_init(mutex, NULL);
-
-  struct worker_args args = {
+  struct worker worker = {
     .config = config,
-    .num_cons_mutex = mutex,
-    .num_cons = num_cons,
-    .accepting_cons = accepting_cons,
-    .new_con_rx = newpipe[0],
-    .con_msg_tx = msgpipe[1],
+
+    .connections = malloc(sizeof(struct worker_connection) * max_cons),
+    .pollfds = malloc(sizeof(struct pollfd) * (max_cons + 1)),
+
+    .num_cons = malloc(sizeof(int)),
+    .num_incoming_cons = malloc(sizeof(int)),
+    .num_cons_mutex = malloc(sizeof(pthread_mutex_t)),
+
+    .con_msg_tx = con_msg[1],
+    .new_con_rx = new_con[0],
+
     .id = id,
   };
 
-  struct worker_args* args_ptr = malloc(sizeof(struct worker_args));
-  *args_ptr = args;
+  *worker.num_cons = 0;
+  *worker.num_incoming_cons = 0;
+  if (pthread_mutex_init(worker.num_cons_mutex, NULL) != 0)
+    VC_LOG_ERR("failed to create pthread mutex");
+
+  // alongside listening to socket FD's,
+  // we need to also listen to the new_con_rx pipe
+  // so we also add 1 to the poll(...) call (see below)
+  worker.pollfds[0].events = POLLIN;
+  worker.pollfds[0].fd = worker.new_con_rx;
+
+  struct worker* wptr = malloc(sizeof(struct worker));
+  *wptr = worker;
 
   pthread_t thread;
-  pthread_create(&thread, NULL, worker_logic, (void*)args_ptr);
+  pthread_create(&thread, NULL, worker_logic, (void*)wptr);
 
-  struct vcd_worker_handle handle = {
-    .num_cons = num_cons,
-    .accepting = accepting_cons,
-    .num_cons_mutex = mutex,
-    .new_con_tx = newpipe[1],
-    .con_msg_rx = msgpipe[0],
-    .thread = thread,
-  };
+  struct vcd_worker_handle handle;
+  handle.num_cons = worker.num_cons;
+  handle.num_incoming_cons = worker.num_incoming_cons;
+  handle.num_cons_mutex = worker.num_cons_mutex;
+  handle.con_msg_rx = con_msg[0];
+  handle.new_con_tx = new_con[1];
+  handle.thread = thread;
 
   return handle;
 }
@@ -330,7 +316,8 @@ worker_spawn(const struct vcd_config* config, int id)
 extern void
 vcd_worker_cleanup(struct vcd_worker_handle* handle)
 {
-  free(handle->num_cons);
+  free((void*)handle->num_cons);
   pthread_mutex_destroy(handle->num_cons_mutex);
   free(handle->num_cons_mutex);
+  pthread_cancel(handle->thread);
 }

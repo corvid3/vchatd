@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 int
 main(void)
@@ -30,7 +32,16 @@ main(void)
   printf("connected\n");
   fflush(stdout);
 
-  char* buf = "ping";
+// 63kb of info
+#define KILO 1024
+#define BUFSIZE (63 * KILO)
+  char* buf = malloc(BUFSIZE + 1);
+  time_t now;
+  time(&now);
+  srand(now);
+  for (int i = 0; i < BUFSIZE; i++)
+    buf[i] = rand() % 0xFE + 1;
+  buf[BUFSIZE] = 0;
   unsigned short buf_len = strlen(buf);
 
   send(fd, &buf_len, sizeof buf_len, MSG_WAITALL);
@@ -39,11 +50,12 @@ main(void)
   char* new_buf = NULL;
   unsigned short incoming_buf = 0;
 
+  // printf("in: %i\n", incoming_buf);
   recv(fd, &incoming_buf, sizeof incoming_buf, MSG_WAITALL);
   new_buf = calloc(sizeof incoming_buf + 1, 1);
   recv(fd, new_buf, incoming_buf, MSG_WAITALL);
 
-  printf("got response!\n\t%s\n", new_buf);
+  // printf("got response!\n\t%s\n", new_buf);
 
   free(new_buf);
 }

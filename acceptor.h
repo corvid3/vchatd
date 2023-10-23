@@ -17,6 +17,8 @@ struct vcd_acceptor_return {
 	int incoming_pipe_rx;
 
 	pthread_t thread;
+
+	int acceptor_fd_copy;
 };
 
 extern struct vcd_acceptor_return start_acceptor(struct vcd_config* config);
