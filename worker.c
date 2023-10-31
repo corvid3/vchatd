@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "config.h"
@@ -38,7 +39,14 @@ struct worker
 {
   const struct vcd_config* config;
 
+  // list of all _client_ connections, along with some state
+  // for asynchronous socket IO
   struct worker_connection* connections;
+
+  // list of polled file-descriptors
+  // does not map 1-1 with `connections`
+  // contains both client connection fd,
+  //   the incoming connection socket from the acceptor
   struct pollfd* pollfds;
 
   pthread_mutex_t* num_cons_mutex;
@@ -109,7 +117,7 @@ worker_disconnect(struct worker* worker, int fd)
 static void
 worker_seek_logic(struct worker* worker, struct worker_connection* con)
 {
-  const int rb = read(con->connection.sockfd, con->len_buf, 2);
+  const int rb = recv(con->connection.sockfd, con->len_buf, 2, MSG_DONTWAIT);
 
   if (rb <= 0) {
     VC_LOG_ERR("client disconnected while in seek stage");
@@ -140,8 +148,10 @@ static void
 worker_read_logic(struct worker* worker, struct worker_connection* con)
 {
   const int req = *(unsigned short*)con->len_buf - con->data_buf_len;
-  const int rb =
-    read(con->connection.sockfd, con->data_buf + con->data_buf_len, req);
+  const int rb = recv(con->connection.sockfd,
+                      con->data_buf + con->data_buf_len,
+                      req,
+                      MSG_DONTWAIT);
 
   if (rb <= 0) {
     VC_LOG_ERR("client disconnected while in read stage");
@@ -151,10 +161,9 @@ worker_read_logic(struct worker* worker, struct worker_connection* con)
 
   con->data_buf_len += rb;
   if (con->data_buf_len == *(unsigned short*)con->len_buf) {
-    //   // printf("GOT MESSAGE: %s\n", con->data_buf);
     unsigned short reply_len = con->data_buf_len;
-    write(con->connection.sockfd, &reply_len, sizeof(unsigned short));
-    write(con->connection.sockfd, con->data_buf, con->data_buf_len);
+    send(con->connection.sockfd, &reply_len, sizeof(unsigned short), 0);
+    send(con->connection.sockfd, con->data_buf, con->data_buf_len, 0);
 
     con->data_buf_len = 0;
     free(con->data_buf);

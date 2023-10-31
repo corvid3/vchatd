@@ -2,31 +2,48 @@
 #include "args.h"
 #include "boss.h"
 #include "config.h"
+#include "worker.h"
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
+bool kill = false;
+
+void
+sighandler(int sigval)
+{
+  (void)sigval;
+  printf("killing server\n");
+  kill = true;
+}
+
 int
 main(int argc, const char** argv)
 {
+  signal(SIGINT, sighandler);
+
   struct vcd_arguments args = get_arguments(argc, argv);
   struct vcd_config conf = config_parse_path(args.conf_filepath);
   config_dump(stdout, &conf);
 
+  // spin up workers
+  struct vcd_worker_handle* workers =
+    calloc(conf.server.num_workers, sizeof(struct vcd_worker_handle));
+  for (int i = 0; i < conf.server.num_workers; i++)
+    workers[i] = worker_spawn(&conf, i);
+
   // start acceptor
-  struct vcd_acceptor_return accept = start_acceptor(&conf);
-
-  // start logic
-  // TODO:
-
-  // spin up boss, boss spins up workers and handles message brokering
-  struct boss_args boss_args = {
-    .acceptor_rx = accept.incoming_pipe_rx,
-    .conf = &conf,
+  struct vcd_acceptor_args acc_args = {
+    .config = &conf,
+    .worker_handles = workers,
   };
-  pthread_t thread = boss_spawn(boss_args);
-  pthread_join(thread, NULL);
+
+  struct vcd_acceptor_return accept = start_acceptor(acc_args);
+
+  while (!kill)
+    sleep(1);
 
   // shut down the acceptor
   pthread_cancel(accept.thread);

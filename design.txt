@@ -49,10 +49,9 @@ running in it's own thread, the acceptor sets up a listened TCP port
 	and takes in any incoming connections
 incoming connections are forwarded to the boss/message manager.
 
-# boss / message manager
-the boss is the heart of the vchatd implementation, working as the
-	message coordinator, making sure the right questions between workers
-	get to eachother.
-the boss also makes a few decisions, such as which worker to send
-	new connections to, which logic handler to send a question to,
-	etcetera
+# connection workers
+the connection workers handle all of the in/out data of client socket streams
+a fixed amount of workers are spun up at the start of the daemon,
+	and new connections are evenly spread out to the workers
+a worker can hold MAX_CONS/MAX_WORKERS number of connections
+when a full message is successfully received from the 
