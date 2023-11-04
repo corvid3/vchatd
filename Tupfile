@@ -1,7 +1,11 @@
-CFLAGS += -Wall -Wextra -Werror -pedantic 
-CFLAGS += --std=c11
-CFLAGS += -fstack-protector-all 
-CFLAGS += -g
+CC = gcc
 
-: foreach *.c |> clang $(CFLAGS) -c %f -o %o |> %B.o
-: *.o tomlc99/libtoml.a |> clang %f -o %o -g |> vchatd.out
+CFLAGS += -fdiagnostics-color=always
+CFLAGS += -Wall -Wextra -Werror -pedantic -pedantic-errors 
+CFLAGS += --std=c11
+CFLAGS += -fomit-frame-pointer -flto
+CFLAGS += -g -O2
+
+: |> make -C tomlc99 libtoml.a && rm tomlc99/toml.o |> tomlc99/libtoml.a
+: foreach *.c |> $(CC) $(CFLAGS) -c %f -o %o |> %B.o
+: *.o tomlc99/libtoml.a |> $(CC) $(CFLAGS) %f -o %o && strip -s %o |> vchatd.out
